@@ -83,6 +83,9 @@ func (k *KVStore) Apply(e Entry) ApplyResult {
 func (k *KVStore) applyNew(cmd Command) ApplyResult {
 	r := ApplyResult{Index: 0, Key: cmd.Key}
 	switch cmd.Kind {
+	case CmdNoop:
+		// 领导者任期起始的空条目：不改变任何状态，仅用于让 commitIndex
+		// 安全越过本任期起点（从而覆盖此前任期已复制但未标记提交的历史）。
 	case CmdSet:
 		k.data[cmd.Key] = cmd.Val
 		r.Value = cmd.Val

@@ -112,14 +112,16 @@ func TestPartitionMinorityCannotWrite(t *testing.T) {
 	t.Log("PHASE-4 partition healed; expecting convergence")
 	env.Stabilize()
 
+	// 提交序号的具体取值随任期起始 no-op 条目数量变化，这里断言“全部收敛到同一点”。
+	wantCommit := env.Nodes[majorityLeader].CommitIndex()
 	for _, id := range env.IDs {
 		nd := env.Nodes[id]
 		if nd.Term() != env.Nodes[majorityLeader].Term() {
 			t.Fatalf("node %s term=%d, want converged term=%d",
 				id, nd.Term(), env.Nodes[majorityLeader].Term())
 		}
-		if nd.CommitIndex() != 2 {
-			t.Fatalf("node %s commit=%d, want 2", id, nd.CommitIndex())
+		if nd.CommitIndex() != wantCommit {
+			t.Fatalf("node %s commit=%d, want converged commit=%d", id, nd.CommitIndex(), wantCommit)
 		}
 		v, ok := nd.cfg.SM.Read("x")
 		if !ok || v != "1" {

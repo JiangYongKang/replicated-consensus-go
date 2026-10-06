@@ -26,9 +26,10 @@ func (r Role) String() string {
 type CommandKind string
 
 const (
-	CmdSet CommandKind = "set"
-	CmdInc CommandKind = "inc"
-	CmdGet CommandKind = "get" // get 仅用于读取路径，正常不会进入日志
+	CmdSet  CommandKind = "set"
+	CmdInc  CommandKind = "inc"
+	CmdGet  CommandKind = "get"  // get 仅用于读取路径，正常不会进入日志
+	CmdNoop CommandKind = "noop" // 领导者上任时追加的本任期空条目，用于安全推进 commitIndex
 )
 
 // Command 是复制到各副本的确定性写命令。
