@@ -59,10 +59,13 @@ func u64(v uint64) string {
 
 // readWait 跟踪一个线性一致读在途确认（ReadIndex 心跳多数派）。
 type readWait struct {
-	key     string
-	acks    map[string]bool
-	future  *ReadFuture
-	timerID int64
+	id        uint64
+	key       string
+	readIndex uint64 // 读发起时的服务下界：max(commitIndex, barrierIndex)
+	minBeat   uint64 // 只统计该轮次（含）之后的心跳响应，杜绝旧轮次响应冒充确认
+	acks      map[string]bool
+	future    *ReadFuture
+	timerID   int64
 }
 
 // deferredCall 是“必须在释放节点锁之后”执行的回调，用于避免
@@ -84,7 +87,10 @@ type Node struct {
 	matchIndex    map[string]uint64
 	pending       map[uint64]*proposal // index -> 在途提案
 	inflight      map[string]*proposal // (ClientID#Seq) -> 在途提案（重发去重）
-	pendingRead   *readWait
+	pendingReads  map[uint64]*readWait // readID -> 在途线性一致读（支持并发）
+	readSeq       uint64               // 读请求单调编号
+	barrierIndex  uint64               // 本任期上任时追加的 no-op 栅栏序号；0 表示非本任期领导
+	beatSeq       uint64               // 心跳轮次：读注册时递增，响应按轮次归属到读
 	electionTimer int64 // Scheduler 事件 ID，-1 表示无
 	heartTimer    int64
 	closed        bool
@@ -126,6 +132,7 @@ func NewNode(cfg Config) *Node {
 		matchIndex:    map[string]uint64{},
 		pending:       map[uint64]*proposal{},
 		inflight:      map[string]*proposal{},
+		pendingReads:  map[uint64]*readWait{},
 		rngState:      seed | 1,
 	}
 	return n
@@ -166,10 +173,7 @@ func (n *Node) Close() error {
 	n.closed = true
 	n.cancelTimers()
 	n.failAllPendingLocked(ReasonClosed, "node closed")
-	if n.pendingRead != nil {
-		n.enqueueRead(n.pendingRead.future, "", false, &WriteError{Reason: ReasonClosed})
-		n.pendingRead = nil
-	}
+	n.failReadLocked(ReasonClosed, "node closed")
 	// 注意：不关闭 n.cfg.Storage——其生命周期由装配方（SimEnv 或真实进程）管理，
 	// 节点重启会复用同一持久存储。
 	defers := n.deferred
@@ -242,6 +246,8 @@ func (n *Node) Propose(ctx context.Context, cmd Command) *WriteFuture {
 }
 
 // Read 发起一次线性一致读（ReadIndex），仅领导者可服务。
+// 支持并发：每个读独立登记、独立计时，互不覆盖；心跳响应按轮次归属到
+// 所有在该轮次（含）之后注册的读。
 func (n *Node) Read(ctx context.Context, key string) *ReadFuture {
 	var rf *ReadFuture
 	n.runLocked(func() {
@@ -253,20 +259,32 @@ func (n *Node) Read(ctx context.Context, key string) *ReadFuture {
 			rf = readyRead("", false, n.notLeaderErr("read"))
 			return
 		}
-		// 先确保领导者身份：广播一轮心跳拿到多数确认。
-		rw := &readWait{
-			key:    key,
-			acks:   map[string]bool{n.cfg.ID: true},
-			future: newReadFuture(),
+		// 服务下界：必须等到本任期栅栏提交（commitIndex 覆盖前任已提交历史），
+		// 且本地已应用到读发起时的提交点，才能从状态机取值。
+		readIndex := n.hard.CommitIndex
+		if n.barrierIndex > readIndex {
+			readIndex = n.barrierIndex
 		}
-		rw.timerID = n.cfg.Sched.AfterInternal(n.cfg.ProposalDeadline, func() { n.onReadTimeout() })
-		n.pendingRead = rw
+		n.readSeq++
+		n.beatSeq++ // 新一轮心跳：只承认该轮次（含）之后的响应
+		rw := &readWait{
+			id:        n.readSeq,
+			key:       key,
+			readIndex: readIndex,
+			minBeat:   n.beatSeq,
+			acks:      map[string]bool{n.cfg.ID: true},
+			future:    newReadFuture(),
+		}
+		id := rw.id
+		rw.timerID = n.cfg.Sched.AfterInternal(n.cfg.ProposalDeadline, func() { n.onReadTimeout(id) })
+		n.pendingReads[rw.id] = rw
 		for _, peer := range n.cfg.Peers {
 			if peer != n.cfg.ID {
 				n.broadcastAppendLocked(peer)
 			}
 		}
-		n.logf("read: term=%d key=%q -> awaiting heartbeat quorum=%d", n.hard.Term, key, n.quorum())
+		n.logf("read: term=%d key=%q read#=%d readIndex=%d beat=%d -> awaiting heartbeat quorum=%d",
+			n.hard.Term, key, rw.id, readIndex, n.beatSeq, n.quorum())
 		rf = rw.future
 	})
 	return rf
@@ -346,6 +364,7 @@ func (n *Node) campaignLocked() {
 	n.role = Candidate
 	n.hard.Term++
 	n.leaderID = ""
+	n.barrierIndex = 0
 	n.votes = map[string]bool{n.cfg.ID: true}
 	n.hard.VoteFor = n.cfg.ID
 	if !wasLeader {
@@ -386,6 +405,7 @@ func (n *Node) becomeFollowerLocked(term uint64, leader string) {
 	n.role = Follower
 	n.hard.Term = term
 	n.hard.VoteFor = ""
+	n.barrierIndex = 0
 	if leader != "" {
 		n.leaderID = leader
 	}
@@ -415,6 +435,20 @@ func (n *Node) becomeLeaderLocked() {
 	n.matchIndex[n.cfg.ID] = last
 	n.logf("become-leader: term=%d commit=%d votes=%d/%d (basis: majority votes granted)",
 		n.hard.Term, n.hard.CommitIndex, len(n.votes), len(n.cfg.Peers))
+	// 提交栅栏：追加一条本任期 no-op。Raft 提交规则只允许按副本计数提交
+	// 本任期条目；栅栏提交后，commitIndex 才确定覆盖前任已提交的全部历史，
+	// 此后的线性一致读才能满足“领导更替后仍读到最新已确认写入”。
+	idx := last + 1
+	e := Entry{Term: n.hard.Term, Index: idx, Cmd: Command{Kind: CmdNop}}
+	if err := n.cfg.Storage.Append(idx-1, []Entry{e}); err != nil {
+		n.logf("become-leader: append barrier failed: %v", err)
+	} else {
+		n.barrierIndex = idx
+		n.matchIndex[n.cfg.ID] = idx
+		n.pending[idx] = &proposal{cmd: e.Cmd, index: idx, acks: map[string]bool{n.cfg.ID: true}, timerID: -1}
+		n.logf("barrier: term=%d index=%d (basis: leader must commit a current-term entry before serving reads)",
+			n.hard.Term, idx)
+	}
 	// 胜选：取消选举定时器（其回调绝不能在领导任期内迟到触发）。
 	if n.electionTimer >= 0 {
 		n.cfg.Sched.Cancel(n.electionTimer)
@@ -493,7 +527,7 @@ func (n *Node) handleVoteRespLocked(m Message) {
 }
 
 func (n *Node) handleAppendLocked(m Message) {
-	reply := Message{Type: MsgAppendResp, From: n.cfg.ID, To: m.From, Term: n.hard.Term}
+	reply := Message{Type: MsgAppendResp, From: n.cfg.ID, To: m.From, Term: n.hard.Term, BeatSeq: m.BeatSeq}
 
 	if m.Term < n.hard.Term {
 		reply.Success = false
@@ -589,10 +623,13 @@ func (n *Node) handleAppendRespLocked(m Message) {
 				p.acks[m.From] = true
 			}
 		}
-		if n.pendingRead != nil {
-			n.pendingRead.acks[m.From] = true
-			n.tryCompleteReadLocked()
+		// 心跳响应按轮次归属：只计入在该读注册轮次（含）之后发出的心跳。
+		for _, rw := range n.pendingReads {
+			if m.BeatSeq >= rw.minBeat {
+				rw.acks[m.From] = true
+			}
 		}
+		n.tryCompleteReadsLocked()
 		n.advanceCommitLocked()
 		// 可能还有更多日志可发（成功响应后追赶窗口）。
 		if n.cfg.Storage.LastIndex() >= n.nextIndex[m.From] {
@@ -640,6 +677,7 @@ func (n *Node) broadcastAppendLocked(peer string) {
 		Entries:      entries,
 		LeaderCommit: n.hard.CommitIndex,
 		LeaderHint:   n.cfg.ID,
+		BeatSeq:      n.beatSeq,
 	})
 }
 
@@ -687,23 +725,26 @@ func (n *Node) applyCommittedLocked() {
 		res := n.cfg.SM.Apply(e)
 		n.applied = idx
 		if p, ok := n.pending[idx]; ok {
-			if res.Err != nil {
-				n.enqueueWrite(p.future, res, &WriteError{
-					Reason:     ReasonStaleRequest,
-					LeaderHint: n.cfg.ID,
-					Term:       n.hard.Term,
-					Detail:     "applied command rejected as stale/duplicate-conflict",
-				})
-			} else {
-				n.enqueueWrite(p.future, res, nil)
+			if p.future != nil { // no-op 栅栏无客户端 future
+				if res.Err != nil {
+					n.enqueueWrite(p.future, res, &WriteError{
+						Reason:     ReasonStaleRequest,
+						LeaderHint: n.cfg.ID,
+						Term:       n.hard.Term,
+						Detail:     "applied command rejected as stale/duplicate-conflict",
+					})
+				} else {
+					n.enqueueWrite(p.future, res, nil)
+				}
 			}
-			n.cfg.Sched.Cancel(p.timerID)
+			n.cancelTimer(p.timerID)
 			delete(n.pending, idx)
 			if p.cmd.ClientID != "" {
 				delete(n.inflight, proposalKey(p.cmd))
 			}
 		}
 	}
+	n.tryCompleteReadsLocked()
 }
 
 func (n *Node) onProposalTimeout(idx uint64) {
@@ -737,64 +778,82 @@ func (n *Node) onProposalTimeout(idx uint64) {
 	})
 }
 
-func (n *Node) tryCompleteReadLocked() {
-	rw := n.pendingRead
-	if rw == nil || len(rw.acks) < n.quorum() {
-		return
+// tryCompleteReadsLocked 检查全部在途读：心跳多数确认（轮次有效）且本地已应用
+// 到该读的服务下界（含本任期栅栏）后，从状态机取值兑现；条件不满足的读继续等待。
+func (n *Node) tryCompleteReadsLocked() {
+	for id, rw := range n.pendingReads {
+		if len(rw.acks) < n.quorum() {
+			continue
+		}
+		if n.applied < rw.readIndex {
+			continue // 栅栏/提交点尚未应用到本地，绝不返回陈旧值
+		}
+		v, found := n.cfg.SM.Read(rw.key)
+		n.logf("read-ok: term=%d key=%q read#=%d readIndex=%d commit=%d (basis: heartbeat quorum=%d beat>=%d then local apply)",
+			n.hard.Term, rw.key, rw.id, rw.readIndex, n.hard.CommitIndex, n.quorum(), rw.minBeat)
+		n.enqueueRead(rw.future, v, found, nil)
+		n.cancelTimer(rw.timerID)
+		delete(n.pendingReads, id)
 	}
-	// 心跳多数确认：领导者身份有效。等待本节点应用到心跳发起时的提交点
-	// （心跳携带 LeaderCommit 已在往返中使该条件成立），随后本地读。
-	n.applyCommittedLocked()
-	v, found := n.cfg.SM.Read(rw.key)
-	n.logf("read-ok: term=%d key=%q commit=%d (basis: heartbeat quorum=%d then local apply)",
-		n.hard.Term, rw.key, n.hard.CommitIndex, n.quorum())
-	n.enqueueRead(rw.future, v, found, nil)
-	n.cfg.Sched.Cancel(rw.timerID)
-	n.pendingRead = nil
 }
 
-func (n *Node) onReadTimeout() {
+func (n *Node) onReadTimeout(id uint64) {
 	n.runLocked(func() {
-		if n.pendingRead == nil {
+		rw, ok := n.pendingReads[id]
+		if !ok {
 			return
 		}
 		reason := ReasonNoQuorum
-		if n.role != Leader {
+		detail := "heartbeat quorum not confirmed within deadline"
+		switch {
+		case n.role != Leader:
 			reason = ReasonNotLeader
+			detail = "leadership changed while awaiting read quorum"
+		case n.applied < rw.readIndex:
+			detail = "commit barrier not applied within deadline (no quorum to commit current-term entry)"
 		}
-		n.logf("read-timeout: term=%d acks=%d/%d -> %s",
-			n.hard.Term, len(n.pendingRead.acks), len(n.cfg.Peers), reason)
-		n.enqueueRead(n.pendingRead.future, "", false, &WriteError{
-			Reason:     reason,
-			LeaderHint: n.leaderID,
-			Term:       n.hard.Term,
-		})
-		n.pendingRead = nil
-	})
-}
-
-func (n *Node) failReadLocked(reason FailReason, detail string) {
-	if n.pendingRead == nil {
-		return
-	}
-	n.cfg.Sched.Cancel(n.pendingRead.timerID)
-	n.enqueueRead(n.pendingRead.future, "", false, &WriteError{Reason: reason, Term: n.hard.Term, Detail: detail})
-	n.pendingRead = nil
-}
-
-func (n *Node) failAllPendingLocked(reason FailReason, detail string) {
-	for idx, p := range n.pending {
-		n.cfg.Sched.Cancel(p.timerID)
-		n.enqueueWrite(p.future, ApplyResult{}, &WriteError{
+		n.logf("read-timeout: term=%d read#=%d acks=%d/%d applied=%d readIndex=%d -> %s",
+			n.hard.Term, id, len(rw.acks), len(n.cfg.Peers), n.applied, rw.readIndex, reason)
+		n.enqueueRead(rw.future, "", false, &WriteError{
 			Reason:     reason,
 			LeaderHint: n.leaderID,
 			Term:       n.hard.Term,
 			Detail:     detail,
 		})
+		delete(n.pendingReads, id)
+	})
+}
+
+func (n *Node) failReadLocked(reason FailReason, detail string) {
+	for id, rw := range n.pendingReads {
+		n.cancelTimer(rw.timerID)
+		n.enqueueRead(rw.future, "", false, &WriteError{Reason: reason, Term: n.hard.Term, Detail: detail})
+		delete(n.pendingReads, id)
+	}
+}
+
+func (n *Node) failAllPendingLocked(reason FailReason, detail string) {
+	for idx, p := range n.pending {
+		n.cancelTimer(p.timerID)
+		if p.future != nil { // no-op 栅栏无客户端 future，静默丢弃即可
+			n.enqueueWrite(p.future, ApplyResult{}, &WriteError{
+				Reason:     reason,
+				LeaderHint: n.leaderID,
+				Term:       n.hard.Term,
+				Detail:     detail,
+			})
+		}
 		delete(n.pending, idx)
 		if p.cmd.ClientID != "" {
 			delete(n.inflight, proposalKey(p.cmd))
 		}
+	}
+}
+
+// cancelTimer 统一处理“无定时器”（timerID<0，如 no-op 栅栏）的情形。
+func (n *Node) cancelTimer(id int64) {
+	if id >= 0 {
+		n.cfg.Sched.Cancel(id)
 	}
 }
 

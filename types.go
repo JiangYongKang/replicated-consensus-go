@@ -29,6 +29,10 @@ const (
 	CmdSet CommandKind = "set"
 	CmdInc CommandKind = "inc"
 	CmdGet CommandKind = "get" // get 仅用于读取路径，正常不会进入日志
+	// CmdNop 是领导者上任时追加的空命令（提交栅栏）：只有本任期条目被多数
+	// 复制并提交后，领导者才能确定自己的 commitIndex 覆盖了前任已提交的全部
+	// 历史，线性一致读必须等到该栅栏提交之后才能服务。
+	CmdNop CommandKind = "nop"
 )
 
 // Command 是复制到各副本的确定性写命令。
@@ -89,6 +93,7 @@ type Message struct {
 	Entries      []Entry // Append: 待追加条目（心跳为空）
 	LeaderCommit uint64  // Append: 领导者已提交序号
 	LeaderHint   string  // Append: 领导者 ID，便于客户端重定向
+	BeatSeq      uint64  // Append/AppendResp: 心跳轮次，读确认按轮次归属
 
 	Granted       bool   // 响应：是否同意
 	Success       bool   // 响应：追加是否成功

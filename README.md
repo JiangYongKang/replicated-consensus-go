@@ -5,6 +5,9 @@
 
 - 领导者选举与任期推进（同一任期至多一个领导者）；
 - 多数派提交（写入在多数确认前对调用方不可见）；
+- 领导更替后的读己之写（上任 no-op 栅栏 + ReadIndex 读服务下界）；
+- 可达副本的已提交历史收敛（落后者被追平，未提交写绝不残留）；
+- 领导者同刻并发读（各自正确、失败原因可区分）；
 - 网络分区、领导者重启、并发与重试下结论一致；
 - 客户端超时重发的端到端幂等；
 - 可区分的失败原因（不把所有错误归一化）。
@@ -45,7 +48,8 @@
   （相同 `(Index,Term)` 跳过，冲突位置截断后重写）。
 - 提交规则严格遵循 Raft：只有当某条**本任期**日志被多数 `matchIndex` 覆盖时，
   领导者才推进 `commitIndex`。旧任期条目不能仅凭副本计数提交，
-  从而避免“已提交后被覆盖”。
+  从而避免“已提交后被覆盖”。领导者当选时会立即追加一条本任期 no-op
+  （`CmdNop`，见 1.4），作为把提交点推进到覆盖前任历史的栅栏。
 - `commitIndex` 通过后续 `AppendEntries.LeaderCommit` 传播；
   领导者在提交推进的当刻会立即补发一轮（不必等下一次心跳）。
 - 已提交日志按序应用到确定性状态机（`KVStore`）。**未提交的写入在领导更替后
@@ -59,13 +63,56 @@
   `timeout`（仅部分确认）失败，**结果对调用方不可见**；
 - 其本地未提交日志在分区恢复后被多数派历史截断（测试中断言 `ghost` 键不存在）。
 
-### 1.4 线性一致读
+### 1.4 线性一致读与领导更替后的读己之写
 
-`Node.Read` 采用 ReadIndex 思路：领导者先广播一轮心跳确认自己仍被多数承认，
-然后等待本地应用到该提交点，再返回本地状态。跟随者的读请求被
-`not_leader` 拒绝（客户端改道领导者）。
+`Node.Read` 采用 ReadIndex 思路，并针对领导更替做了两道保险：
 
-### 1.5 客户端幂等（超时重发不重复应用）
+1. **上任栅栏（commit barrier）**：领导者当选时立刻追加一条本任期的
+   no-op 日志（`CmdNop`）。Raft 的提交规则只允许按副本计数提交本任期条目，
+   因此新领导者的 `commitIndex` 可能落后于旧领导者已确认过的写入；
+   只有当这条 no-op 被多数复制并提交后，新领导者的提交点才确定覆盖
+   前任已提交的全部历史。
+2. **读服务下界**：每次读登记时记录
+   `readIndex = max(commitIndex, barrierIndex)`，必须同时满足
+   「心跳多数确认（按心跳轮次 `BeatSeq` 归属，杜绝旧轮次响应冒充确认）」
+   且「本地已应用到 readIndex」才从状态机取值。
+
+由此保证：**只要一次写已向调用方确认成功，之后无论旧领导被隔离、重启，
+还是有副本没来得及收到提交通知，客户端改道到新领导后读同一个键，
+都必须读到那次（或更新的）写入**，不会读回空值或旧值——该性质由
+`TestReadYourWritesAfterLeaderChange` / `TestReadYourWritesAfterLeaderRestart`
+确定性复现（测试中让新领导者恰好是“有条目但错过提交通知”的落后副本）。
+
+**并发读**：领导者同一时刻可服务多个读。每个读独立登记、独立计时，
+心跳响应按轮次归属到所有在该轮次之后注册的读；结果互不覆盖、不丢失、
+不卡死（`TestConcurrentReads`）。若此刻无法确认多数派（例如被分区），
+读在 `ProposalDeadline` 后以**可区分的 `no_quorum`** 失败
+（`TestConcurrentReadsFailDistinguishably`），绝不返回陈旧值糊弄调用方。
+跟随者的读请求被 `not_leader` 拒绝（客户端按 `LeaderHint` 改道）。
+
+### 1.5 提交收敛的适用边界
+
+领导更替完成后，**所有仍在运行且相互可达的副本**会在有限时间内收敛到
+同一条已提交历史（`commitIndex` 相同且 `[1, commitIndex]` 逐条一致，
+见 `TestCommitConvergenceAfterPartitionHeal`）：
+
+- 进度落后的副本由领导者按 `nextIndex` 退避重发追平（追赶幂等）；
+- 少数派持有的未提交条目被多数派历史截断覆盖，**绝不会因为换了领导
+  就变成已提交**；
+- 落后副本在追平前不对外服务：读/写都以 `not_leader` 明确拒绝
+  （`TestLaggingReplicaCaughtUpOrRejected`）；
+- 收敛后新的写入从这条一致的历史上继续追加。
+
+边界条件：
+
+- 收敛只在**可达副本**之间成立。被永久分区出去的副本不会收敛，
+  但它也无法凑齐多数派，因此不能服务任何写或线性一致读；
+- 可用性要求多数派在线：`N` 副本集群最多容忍 `⌊(N-1)/2⌋` 个副本
+  不可达；不足多数时所有新写与读都以 `no_quorum` 失败，已提交历史
+  不受影响；
+- `SimEnv.Converge(totalMs)` 有总虚拟时间上界，永久分区场景必然终止。
+
+### 1.6 客户端幂等（超时重发不重复应用）
 
 每条客户端写命令携带单调递增的 `(ClientID, Seq)`：
 
@@ -76,7 +123,7 @@
 - 领导者对同一 `(ClientID, Seq)` 的在途提案去重，重发直接复用原 future，
   不产生未提交垃圾条目。
 
-### 1.6 可区分的失败原因
+### 1.7 可区分的失败原因
 
 `WriteError.Reason`（见 `errors.go`）区分：
 
@@ -169,6 +216,12 @@ go test -cover ./...          # 覆盖率（约 78%+）
 | `TestConcurrentProposals` | 12 个客户端并发写，5 副本恰好各应用一次并收敛 |
 | `TestClientRetryAcrossLeaderChange` | 分区+改道下客户端自动重试，相同序号不重复应用 |
 | `TestLinearizableRead` | ReadIndex 读多数确认后返回，跟随者读被改道 |
+| `TestReadYourWritesAfterLeaderChange` | 旧领导被隔离、新领导恰好是错过提交通知的落后副本：客户端改道后仍读到已确认写入，恢复后全量收敛 |
+| `TestReadYourWritesAfterLeaderRestart` | 旧领导隔离+重启再回归：读己之写成立，回归副本被追平且不得以落后提交点服务读 |
+| `TestCommitConvergenceAfterPartitionHeal` | 少数派未提交写（ghost）被截断、可达副本已提交历史逐条一致、后续写从一致历史继续 |
+| `TestLaggingReplicaCaughtUpOrRejected` | 落后副本追平前读/写均以 `not_leader` 拒绝，恢复后被追平到同一提交点 |
+| `TestConcurrentReads` | 领导者同刻多个并发读各自返回正确结果，不互相覆盖、不丢、不卡死 |
+| `TestConcurrentReadsFailDistinguishably` | 无多数派时并发读全部以 `no_quorum` 可区分失败，不返回陈旧值 |
 | `TestDeterministicReproduction` | 两次运行的任期/提交序列逐字节一致 |
 
 ### 4.1 在代码中装配一个集群

@@ -83,6 +83,8 @@ func (k *KVStore) Apply(e Entry) ApplyResult {
 func (k *KVStore) applyNew(cmd Command) ApplyResult {
 	r := ApplyResult{Index: 0, Key: cmd.Key}
 	switch cmd.Kind {
+	case CmdNop:
+		// 提交栅栏：不改变任何状态，仅推进已应用序号。
 	case CmdSet:
 		k.data[cmd.Key] = cmd.Val
 		r.Value = cmd.Val
